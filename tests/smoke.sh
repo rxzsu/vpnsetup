@@ -252,6 +252,26 @@ check "help mentions allow-ips" "yes" "$(vpnsetup_help | grep -q 'allow-ips <pan
 check "help documents sub domain" "yes" "$(vpnsetup_help | grep -q 'VPN_SETUP_SUB_DOMAIN' && echo yes || echo no)"
 check "help mentions doctor"    "yes" "$(vpnsetup_help | grep -q '^  doctor' && echo yes || echo no)"
 
+echo "bootstrap"
+# The bootstrap is the one file that cannot be sourced, so assert on its
+# contents instead: the invariants below have each broken a real install.
+check "install.sh parses"       "yes" "$(bash -n "$ROOT/install.sh" 2>/dev/null && echo yes || echo no)"
+check "all scripts parse"       "0"   "$(bad=0; for f in "$ROOT"/install.sh "$ROOT"/bin/vpnsetup "$ROOT"/lib/*.sh "$ROOT"/lib/panels/*.sh; do bash -n "$f" 2>/dev/null || bad=$((bad+1)); done; printf '%s' "$bad")"
+check "repo is not a placeholder" "yes" "$(grep -q 'readonly DEFAULT_REPO="rxzsu/vpnsetup"' "$ROOT/install.sh" && echo yes || echo no)"
+check "cli shim uses same repo" "yes" "$(grep -q 'VPN_SETUP_REPO:-rxzsu/vpnsetup' "$ROOT/bin/vpnsetup" && echo yes || echo no)"
+check "install.sh is cached too" "yes" "$(grep -q '^  "install.sh"$' "$ROOT/install.sh" && echo yes || echo no)"
+check "tty reattach guarded"    "yes" "$(grep -q 'VPN_SETUP_TTY_REEXEC' "$ROOT/install.sh" && echo yes || echo no)"
+check "headless fallback kept"  "yes" "$(grep -q 'VPN_SETUP_ACTION:-help' "$ROOT/install.sh" && echo yes || echo no)"
+
+# `grep -c $'\r'` is unreliable in Git Bash (it reports CR on pure-LF files);
+# counting the bytes with tr is the check that actually holds.
+crlf=0
+for f in "$ROOT"/install.sh "$ROOT"/bin/vpnsetup "$ROOT"/lib/*.sh "$ROOT"/lib/panels/*.sh "$ROOT"/tests/smoke.sh; do
+  [ "$(tr -cd '\r' < "$f" | wc -c | tr -d ' ')" -gt 0 ] && crlf=$((crlf + 1))
+done
+check "all scripts are LF"      "0"   "$crlf"
+check "gitattributes pins LF"   "yes" "$(grep -q 'eol=lf' "$ROOT/.gitattributes" && echo yes || echo no)"
+
 rm -rf "$TMP"
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -217,7 +217,7 @@ port already claimed by another installed panel.
 
 ```
 install.sh          bootstrap: root check, prerequisites, Docker, module cache,
-                    /usr/local/bin/vpnsetup, tmux wrapper, hand-off
+                    /usr/local/bin/vpnsetup, tty reattach, tmux wrapper, hand-off
 bin/vpnsetup        CLI shim — locates the cached modules and dispatches
 lib/common.sh       logging, OS/package detection, secrets, prompts, state files
 lib/docker.sh       Docker/Compose bootstrap, compose wrappers, health waits
@@ -248,6 +248,15 @@ down a proxy that is currently serving traffic.
 install path (Marzban's script, Remnawave's compose + env contract), the module
 uses it, so the installer does not rot as those projects evolve. Where upstream
 only documents `docker run` (3x-ui), the module writes its own small compose file.
+
+**An SSH drop does not kill the install.** Before anything long-running starts,
+the bootstrap hands over to a `tmux` session (`vpnsetup attach` to come back).
+Two related details matter more than they look: when the bootstrap arrives
+through a pipe (`curl … | bash`), stdin is the script itself, so any prompt would
+eat the script — the bootstrap therefore re-executes its cached copy with
+`/dev/tty` attached. And when there is no terminal at all (CI, cloud-init,
+`ssh host 'bash -s' < install.sh`), it runs the action in `VPN_SETUP_ACTION` once
+and exits instead of trying to draw a menu.
 
 ### Panel module contract
 
