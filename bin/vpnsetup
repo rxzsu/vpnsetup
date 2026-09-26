@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# vpnsetup — CLI entry point. Installed to /usr/local/bin/vpnsetup by install.sh.
+#
+# Thin shim: locate the cached modules and hand over to the dispatcher. All the
+# logic lives in lib/ so the CLI and the bootstrap installer cannot drift apart.
+# ──────────────────────────────────────────────────────────────────────────────
+
+set -uo pipefail
+
+SETUP_DIR="${VPN_SETUP_INSTALL_DIR:-/opt/vpnsetup-setup}"
+REPO="${VPN_SETUP_REPO:-rxzsu/vpnsetup}"
+
+if [ ! -f "$SETUP_DIR/lib/main.sh" ]; then
+  cat >&2 <<EOF
+vpnsetup is not installed (missing $SETUP_DIR/lib/main.sh).
+
+Re-run the installer:
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
+EOF
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+. "$SETUP_DIR/lib/main.sh"
+vpnsetup_entry "$SETUP_DIR/lib" "$@"

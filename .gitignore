@@ -1,0 +1,20 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime junk
+*.log
+*.tmp
+*.bak
+
+# Local state that must never be committed
+.env
+*.env.local
+/state/
+.smoke-tmp/
