@@ -8,6 +8,9 @@
 #   panel_update_<slug>    <id>            — optional, defaults to pull + up
 #
 # <slug> is the id with non-alphanumerics stripped: "3x-ui" -> "3xui".
+#
+# Commands return the EX_* codes from common.sh, so a caller can tell "nothing
+# happened" from "it broke". See vpnsetup_help.
 # ──────────────────────────────────────────────────────────────────────────────
 
 readonly PANEL_IDS=(3x-ui marzban remnawave)
@@ -15,6 +18,12 @@ readonly PANEL_IDS=(3x-ui marzban remnawave)
 panel_catalog_ids() {
   local id
   for id in "${PANEL_IDS[@]}"; do printf '%s\n' "$id"; done
+}
+
+panel_is_known() {
+  local id="$1" p
+  for p in "${PANEL_IDS[@]}"; do [ "$p" = "$id" ] && return 0; done
+  return 1
 }
 
 panel_catalog_name() {
@@ -76,18 +85,30 @@ panel_owner_of_port() {
 }
 
 # validate_panel_port <port> — reject ports that cannot host a panel.
+#
+# Three separate ways a port can be unusable, and only the first two used to be
+# checked. The third is the one that bites: a port held by some unrelated service
+# on the host passed validation and only failed once the panel tried to bind it,
+# which is after the install has already done its work.
 validate_panel_port() {
   local port="$1" owner
   case "$port" in
     80|443)
       log_error "Port $port belongs to the reverse proxy (Caddy) and cannot host a panel."
-      return 1
+      return "$EX_CONFLICT"
       ;;
   esac
+
   owner="$(panel_owner_of_port "$port")" || true
   if [ -n "$owner" ]; then
     log_error "Port $port is already used by $(panel_catalog_name "$owner")."
-    return 1
+    return "$EX_CONFLICT"
+  fi
+
+  if port_in_use "$port"; then
+    log_error "Port $port is already in use on this host by something else."
+    log_dim "  Check with: ss -ltnp | grep ':$port'"
+    return "$EX_CONFLICT"
   fi
   return 0
 }
@@ -101,7 +122,7 @@ ask_panel_port() {
 
   if [ -n "${VPN_SETUP_PORT:-}" ]; then
     port="$(ask_port "$prompt" "$default")"
-    validate_panel_port "$port" || return 1
+    validate_panel_port "$port" || return "$EX_CONFLICT"
     printf '%s' "$port"; return 0
   fi
 
@@ -124,7 +145,7 @@ ask_optional_sub_domain() {
       printf '%s' "$VPN_SETUP_SUB_DOMAIN"
     else
       log_error "VPN_SETUP_SUB_DOMAIN is not a valid domain: $VPN_SETUP_SUB_DOMAIN"
-      return 1
+      return "$EX_USAGE"
     fi
     return 0
   fi
@@ -173,14 +194,14 @@ panel_check_dns() {
   if [ -z "$resolved" ]; then
     log_warn "Could not resolve $domain — the A-record may not exist yet."
     log_warn "Caddy cannot issue a certificate until DNS points here."
-    return 1
+    return "$EX_PRECOND"
   fi
 
   if [ -n "$server_ip" ] && [ "$resolved" != "$server_ip" ]; then
     log_warn "$domain resolves to $resolved, but this server is $server_ip."
     log_warn "That is expected behind Cloudflare/proxy, but HTTP-01 validation"
     log_warn "will fail unless the record is DNS-only (grey cloud) or you use DNS-01."
-    return 1
+    return "$EX_PRECOND"
   fi
 
   log_ok "DNS OK: $domain -> $resolved"
@@ -188,21 +209,95 @@ panel_check_dns() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# JSON views
+# ──────────────────────────────────────────────────────────────────────────────
+_catalog_entry_json() {
+  local id="$1"
+  json_object \
+    "$(json_pair id "$(json_str "$id")")" \
+    "$(json_pair name "$(json_str "$(panel_catalog_name "$id")")")" \
+    "$(json_pair description "$(json_str "$(panel_catalog_desc "$id")")")" \
+    "$(json_pair upstream "$(json_str "$(panel_catalog_upstream "$id")")")" \
+    "$(json_pair license "$(json_str "$(panel_catalog_license "$id")")")" \
+    "$(json_pair default_port "$(json_num "$(panel_default_port "$id")")")" \
+    "$(json_pair installed "$(json_bool "$(state_exists "$id" && printf 1 || printf 0)")")"
+}
+
+_panel_json() {
+  local id="$1" dir sub allow
+  dir="$(state_get "$id" INSTALL_DIR)"
+  sub="$(state_get "$id" SUB_DOMAIN)"
+  [ "$sub" = "$(state_get "$id" DOMAIN)" ] && sub=""
+  allow="$(state_get "$id" ALLOW_IPS)"
+
+  json_object \
+    "$(json_pair id "$(json_str "$id")")" \
+    "$(json_pair name "$(json_str "$(panel_catalog_name "$id")")")" \
+    "$(json_pair domain "$(json_nullable_str "$(state_get "$id" DOMAIN)")")" \
+    "$(json_pair sub_domain "$(json_nullable_str "$sub")")" \
+    "$(json_pair port "$(json_num "$(state_get "$id" PORT)")")" \
+    "$(json_pair allow_ips "$(json_nullable_str "$allow")")" \
+    "$(json_pair install_dir "$(json_str "$dir")")" \
+    "$(json_pair containers "$(compose_containers_json "$dir")")"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# panels — the catalog, including what is not installed yet
+# ──────────────────────────────────────────────────────────────────────────────
+cmd_panels() {
+  local id
+
+  if [ "$OPT_JSON" = "1" ]; then
+    local items=""
+    for id in "${PANEL_IDS[@]}"; do
+      items="${items:+$items,}$(_catalog_entry_json "$id")"
+    done
+    json_emit "$(json_pair panels "[$items]")"
+    return 0
+  fi
+
+  ui_title "Panels"
+  printf '  %s%-12s %-9s %-6s %s%s\n' "$C_DIM" 'ID' 'LICENSE' 'PORT' 'STATE' "$C_RESET"
+  local state
+  for id in "${PANEL_IDS[@]}"; do
+    if state_exists "$id"; then
+      state="${C_BGREEN}installed${C_RESET}"
+    else
+      state="${C_DIM}available${C_RESET}"
+    fi
+    printf '  %s%-12s%s %-9s %-6s %s\n' "$C_BWHITE" "$id" "$C_RESET" \
+      "$(panel_catalog_license "$id")" "$(panel_default_port "$id")" "$state"
+  done
+  return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Shared install entry point
 # ──────────────────────────────────────────────────────────────────────────────
 cmd_install() {
-  local id="${1:-}"
+  local args=("$@")
+
+  # Named options win over the environment: that is the order a control panel
+  # expects, and it keeps the env-var path (CI, cloud-init) working unchanged.
+  local v
+  v="$(opt_value domain '' ${args[@]+"${args[@]}"})";       [ -n "$v" ] && export VPN_SETUP_DOMAIN="$v"
+  v="$(opt_value sub-domain '' ${args[@]+"${args[@]}"})";   [ -n "$v" ] && export VPN_SETUP_SUB_DOMAIN="$v"
+  v="$(opt_value port '' ${args[@]+"${args[@]}"})";         [ -n "$v" ] && export VPN_SETUP_PORT="$v"
+  v="$(opt_value allow-ips '' ${args[@]+"${args[@]}"})";    [ -n "$v" ] && export VPN_SETUP_ALLOW_IPS="$v"
+
+  local id
+  id="$(opt_positionals ${args[@]+"${args[@]}"} | head -1)"
+  [ -n "$id" ] || id="${VPN_SETUP_PANEL:-}"
+
   if [ -z "$id" ]; then
-    id="$(ui_select_panel)" || return 1
+    id="$(ui_select_panel)" || return "$EX_USAGE"
   fi
-  [ -n "$id" ] || return 1
+  [ -n "$id" ] || return "$EX_USAGE"
 
   # Reject unknown ids before touching the filesystem.
-  local known=0 p
-  for p in "${PANEL_IDS[@]}"; do [ "$p" = "$id" ] && known=1 && break; done
-  if [ "$known" -ne 1 ]; then
+  if ! panel_is_known "$id"; then
     log_error "Unknown panel: '$id'. Available: ${PANEL_IDS[*]}"
-    return 1
+    return "$EX_USAGE"
   fi
 
   local slug fn
@@ -210,35 +305,40 @@ cmd_install() {
   fn="panel_install_${slug}"
   if ! declare -F "$fn" >/dev/null; then
     log_error "No installer found for panel '$id'."
-    return 1
+    return "$EX_FAIL"
   fi
 
   ui_title "Install $(panel_catalog_name "$id")"
-  printf '  %s%-12s%s %s\n' "$C_BWHITE" 'Upstream' "$C_RESET" "$(panel_catalog_upstream "$id")"
-  printf '  %s%-12s%s %s\n' "$C_BWHITE" 'License'  "$C_RESET" "$(panel_catalog_license "$id")"
-  printf '  %s%-12s%s %s\n' "$C_BWHITE" 'Panel port' "$C_RESET" "$(panel_default_port "$id")"
-  printf '\n'
+  ui_kv "Upstream"   "$(panel_catalog_upstream "$id")"
+  ui_kv "License"    "$(panel_catalog_license "$id")"
+  ui_kv "Panel port" "$(panel_default_port "$id")"
 
+  # Reinstalling used to be asked as a confirmation whose default answer is "no".
+  # Without a terminal that meant the command printed "Cancelled" and returned 0,
+  # so an automated caller was told the install succeeded while nothing at all
+  # had happened. Now it is an explicit conflict with an explicit override.
   if state_exists "$id"; then
-    log_warn "$(panel_catalog_name "$id") is already installed at $(state_get "$id" INSTALL_DIR)."
-    confirm "Reinstall? This will WIPE its data." "n" || { log_info "Cancelled."; return 0; }
-    cmd_remove "$id" "quiet" || true
+    if [ "$OPT_REINSTALL" != "1" ]; then
+      log_warn "$(panel_catalog_name "$id") is already installed at $(state_get "$id" INSTALL_DIR)."
+      confirm_action "Reinstall? This will WIPE its data." "n" "Pass --reinstall to wipe it."
+    fi
+    cmd_remove "$id" "quiet" || return $?
   fi
 
   require_root
   ensure_docker
 
   local domain
-  domain="$(ask_domain "Panel domain (e.g. panel.example.com)")"
+  domain="$(ask_domain "Panel domain (e.g. panel.example.com)")" || return $?
   panel_check_dns "$domain" || true
 
   # Optional hardening, asked up front so the install runs unattended afterwards.
   local allow_ips="${VPN_SETUP_ALLOW_IPS:-}"
   if [ -z "$allow_ips" ] && have_tty; then
-    printf '\n'
-    log_dim "Panel access can be limited to specific IPs (comma-separated, CIDR allowed)."
-    log_dim "Leave empty to allow everyone — you will need one of these IPs to reach"
-    log_dim "the panel later, so do not lock yourself out."
+    printf '\n' >&2
+    log_dim "Panel access can be limited to specific IPs (comma-separated, CIDR allowed)." >&2
+    log_dim "Leave empty to allow everyone — you will need one of these IPs to reach" >&2
+    log_dim "the panel later, so do not lock yourself out." >&2
     allow_ips="$(ask "Allowed IPs (Enter = allow all)")"
   fi
   if [ -n "$allow_ips" ] && ! is_valid_ip_list "$allow_ips"; then
@@ -246,14 +346,28 @@ cmd_install() {
     allow_ips=""
   fi
 
-  "$fn" "$id" "$domain" || return 1
+  "$fn" "$id" "$domain" || return $?
 
   if [ -n "$allow_ips" ]; then
     state_set "$id" ALLOW_IPS "$allow_ips" || log_warn "Could not record the IP allowlist."
   fi
 
+  # Publish it: the proxy is rendered from the site registry, not from panel state.
+  site_sync_from_panel "$id" || log_warn "The panel is installed but not published yet."
+
   log_step "Applying reverse proxy"
   proxy_up || log_warn "Caddy setup failed — run 'vpnsetup proxy' once DNS/ports are ready."
+
+  local rc=0
+  if ! proxy_wait_for_cert "$domain" 60; then rc="$EX_PARTIAL"; fi
+
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit \
+      "$(json_pair panel "$(_panel_json "$id")")" \
+      "$(json_pair url "$(json_str "https://$domain")")" \
+      "$(json_pair certificate "$(json_bool "$([ "$rc" = "0" ] && printf 1 || printf 0)")")"
+    return "$rc"
+  fi
 
   printf '\n'
   log_ok "$(panel_catalog_name "$id") installed."
@@ -264,7 +378,7 @@ cmd_install() {
   ui_kv "Data" "$(state_get "$id" INSTALL_DIR)"
   ui_kv "Backups" "$(backup_dir_for "$id")"
   printf '\n'
-  proxy_wait_for_cert "$domain" 60 || true
+  return "$rc"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -272,7 +386,8 @@ cmd_install() {
 # ──────────────────────────────────────────────────────────────────────────────
 cmd_update() {
   local id="${1:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || { log_error "Panel '$id' is not installed."; return "$EX_NOTFOUND"; }
 
   local slug fn dir
   slug="$(id_slug "$id")"
@@ -282,22 +397,48 @@ cmd_update() {
   ui_title "Update $(panel_catalog_name "$id")"
 
   if declare -F "$fn" >/dev/null; then
-    "$fn" "$id"
+    "$fn" "$id" || return $?
   else
     ensure_docker
-    [ -d "$dir" ] || { log_error "Install directory missing: $dir"; return 1; }
-    compose_pull "$dir"
+    [ -d "$dir" ] || { log_error "Install directory missing: $dir"; return "$EX_NOTFOUND"; }
+    compose_pull "$dir" || return "$EX_FAIL"
     dc "$dir" up -d || die "docker compose up failed"
   fi
 
   log_ok "Update finished."
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit "$(json_pair panel "$(_panel_json "$id")")"
+    return 0
+  fi
   dc "$dir" ps 2>/dev/null || true
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Status / logs / remove
 # ──────────────────────────────────────────────────────────────────────────────
 cmd_status() {
+  if [ "$OPT_JSON" = "1" ]; then
+    local items="" id
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      items="${items:+$items,}$(_panel_json "$id")"
+    done < <(state_ids)
+
+    local sites="" name
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      sites="${sites:+$sites,}$(json_str "$(site_get "$name" DOMAIN)")"
+    done < <(site_ids)
+
+    json_emit \
+      "$(json_pair panels "[$items]")" \
+      "$(json_pair caddy "$(json_object \
+        "$(json_pair state "$(json_str "$(container_state "$CADDY_CONTAINER")")")" \
+        "$(json_pair sites "[$sites]")")")"
+    return 0
+  fi
+
   ui_title "Status"
   if [ "$(state_count)" -eq 0 ]; then
     log_warn "No panels installed."
@@ -311,30 +452,67 @@ cmd_status() {
     dir="$(state_get "$id" INSTALL_DIR)"
     printf '\n%s%s%s %s(%s)%s\n' "$C_BOLD$C_BWHITE" "$(panel_catalog_name "$id")" "$C_RESET" \
       "$C_DIM" "$id" "$C_RESET"
-    printf '  %s%-12s%s %s\n' "$C_BWHITE" 'Domain' "$C_RESET" "$(state_get "$id" DOMAIN '-')"
-    printf '  %s%-12s%s %s\n' "$C_BWHITE" 'Port'   "$C_RESET" "$(state_get "$id" PORT '-')"
-    printf '  %s%-12s%s %s\n' "$C_BWHITE" 'Dir'    "$C_RESET" "$dir"
+    ui_kv "Domain" "$(state_get "$id" DOMAIN '-')"
+    ui_kv "Port"   "$(state_get "$id" PORT '-')"
+    ui_kv "Dir"    "$dir"
     if [ -d "$dir" ]; then
-      dc "$dir" ps 2>/dev/null | sed 's/^/  /' || true
+      compose_containers "$dir" | while IFS='|' read -r n s st h; do
+        printf '  %-28s %-12s %s%s\n' "$n" "$s" "$st" \
+          "$([ "$h" != "-" ] && printf ' (%s)' "$h")"
+      done
     fi
   done < <(state_ids)
 
   proxy_status
+  return 0
 }
 
 cmd_logs() {
   local id="${1:-}" service="${2:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || { log_error "Panel '$id' is not installed."; return "$EX_NOTFOUND"; }
+
   local dir; dir="$(state_get "$id" INSTALL_DIR)"
-  [ -d "$dir" ] || { log_error "Install directory missing: $dir"; return 1; }
-  log_info "Tailing logs (Ctrl+C to stop)..."
-  dc "$dir" logs -f --tail=200 ${service:+"$service"} || true
+  [ -d "$dir" ] || { log_error "Install directory missing: $dir"; return "$EX_NOTFOUND"; }
+
+  local tail_n="$OPT_TAIL"
+  local svc=(); [ -n "$service" ] && svc=("$service")
+
+  # Logs are a stream, so --json emits NDJSON: one object per line, which is the
+  # only honest shape for output that never ends.
+  if [ "$OPT_JSON" = "1" ]; then
+    if [ "$OPT_FOLLOW" = "1" ]; then
+      log_info "Streaming logs as NDJSON (Ctrl+C to stop)..." >&2
+      dc "$dir" logs -f --tail="$tail_n" ${svc[@]+"${svc[@]}"} 2>&1 |
+        while IFS= read -r line; do
+          printf '{"panel":"%s","line":"%s"}\n' "$(json_escape "$id")" "$(json_escape "$line")"
+        done
+    else
+      local lines="" line
+      while IFS= read -r line; do
+        lines="${lines:+$lines,}$(json_str "$line")"
+      done < <(dc "$dir" logs --tail="$tail_n" ${svc[@]+"${svc[@]}"} 2>&1)
+      json_emit "$(json_pair panel "$(json_str "$id")")" "$(json_pair lines "[$lines]")"
+    fi
+    return 0
+  fi
+
+  if [ "$OPT_FOLLOW" = "1" ]; then
+    log_info "Tailing logs (Ctrl+C to stop)..."
+    dc "$dir" logs -f --tail="$tail_n" ${svc[@]+"${svc[@]}"} || true
+  else
+    dc "$dir" logs --tail="$tail_n" ${svc[@]+"${svc[@]}"} || true
+  fi
+  return 0
 }
 
 cmd_remove() {
   local id="${1:-}" quiet="${2:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
-  state_exists "$id" || { log_warn "Panel '$id' is not installed."; return 0; }
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  if ! state_exists "$id"; then
+    log_warn "Panel '$id' is not installed — nothing to remove."
+    return "$EX_NOTFOUND"
+  fi
 
   local slug fn dir
   slug="$(id_slug "$id")"
@@ -345,31 +523,42 @@ cmd_remove() {
   if [ "$quiet" != "quiet" ]; then
     log_warn "This deletes the containers, the data in $dir and the panel state."
     log_warn "Backups in $(backup_dir_for "$id") are kept."
-    confirm "Continue?" "n" || { log_info "Cancelled."; return 0; }
+    confirm_action "Continue?" "n" "Pass --yes to confirm."
   fi
 
   if declare -F "$fn" >/dev/null; then
-    "$fn" "$id"
+    "$fn" "$id" || return $?
   else
     compose_down "$dir" purge
     rm -rf "$dir"
   fi
 
   state_delete "$id"
-  proxy_reload || true
+  site_delete "$id"
+  proxy_reload || log_warn "Caddy was not reloaded — run 'vpnsetup proxy'."
+
   log_ok "$(panel_catalog_name "$id") removed."
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit "$(json_pair removed "$(json_str "$id")")"
+  fi
+  return 0
 }
 
 cmd_proxy_reapply() {
   local id="${1:-}"
   if [ -n "$id" ]; then
-    state_exists "$id" || die "Panel '$id' is not installed."
+    state_exists "$id" || die_code "$EX_NOTFOUND" "Panel '$id' is not installed."
   fi
   ui_title "Reverse proxy + SSL"
-  proxy_up || return 1
+  site_sync_all
+  proxy_up || return "$EX_FAIL"
   if [ -n "$id" ]; then
     proxy_wait_for_cert "$(state_get "$id" DOMAIN)" 60 || true
   fi
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit "$(json_pair caddy_state "$(json_str "$(container_state "$CADDY_CONTAINER")")")"
+  fi
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -381,8 +570,8 @@ cmd_proxy_reapply() {
 # ──────────────────────────────────────────────────────────────────────────────
 cmd_set_domain() {
   local id="${1:-}" domain="${2:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
-  state_exists "$id" || die "Panel '$id' is not installed."
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || die_code "$EX_NOTFOUND" "Panel '$id' is not installed."
 
   local slug fn current
   slug="$(id_slug "$id")"
@@ -393,18 +582,21 @@ cmd_set_domain() {
   ui_kv "Current" "${current:--}"
 
   if [ -z "$domain" ]; then
-    domain="$(ask_domain "New domain")"
+    domain="$(ask_domain "New domain")" || return $?
   fi
-  is_valid_domain "$domain" || die "Not a valid domain: $domain"
+  is_valid_domain "$domain" || die_code "$EX_USAGE" "Not a valid domain: $domain"
 
   if [ "$domain" = "$current" ]; then
     log_info "Domain unchanged — nothing to do."
+    if [ "$OPT_JSON" = "1" ]; then
+      json_emit "$(json_pair changed false)" "$(json_pair domain "$(json_str "$domain")")"
+    fi
     return 0
   fi
 
   panel_check_dns "$domain" || true
 
-  state_set "$id" DOMAIN "$domain" || die "Could not update the state file."
+  state_set "$id" DOMAIN "$domain" || die_code "$EX_FAIL" "Could not update the state file."
 
   # Panels that bake their own domain into their configuration need to be told;
   # the rest only care about the reverse proxy.
@@ -413,13 +605,21 @@ cmd_set_domain() {
     "$fn" "$id" "$domain" || log_warn "The panel configuration was not updated — check its logs."
   fi
 
-  proxy_reload || { log_warn "Caddy was not reloaded — run 'vpnsetup proxy'."; return 1; }
+  site_sync_from_panel "$id" || log_warn "Could not update the published site."
+
+  proxy_reload || { log_warn "Caddy was not reloaded — run 'vpnsetup proxy'."; return "$EX_PARTIAL"; }
   proxy_wait_for_cert "$domain" 60 || true
+
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit "$(json_pair changed true)" "$(json_pair domain "$(json_str "$domain")")"
+    return 0
+  fi
 
   printf '\n'
   log_ok "Domain updated. Panel data was not touched."
   ui_kv "Panel" "https://$domain"
   log_dim "The old hostname stops working once DNS and the certificate catch up."
+  return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -427,8 +627,8 @@ cmd_set_domain() {
 # ──────────────────────────────────────────────────────────────────────────────
 cmd_set_allow_ips() {
   local id="${1:-}" list="${2:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
-  state_exists "$id" || die "Panel '$id' is not installed."
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || die_code "$EX_NOTFOUND" "Panel '$id' is not installed."
 
   ui_title "Restrict access — $(panel_catalog_name "$id")"
   local current; current="$(state_get "$id" ALLOW_IPS)"
@@ -444,33 +644,110 @@ cmd_set_allow_ips() {
     ""|clear|none)
       if [ -z "$current" ]; then
         log_info "No restriction is set — nothing to do."
+        if [ "$OPT_JSON" = "1" ]; then
+          json_emit "$(json_pair changed false)" "$(json_pair allow_ips null)"
+        fi
         return 0
       fi
-      state_set "$id" ALLOW_IPS "" || die "Could not update the state file."
+      state_set "$id" ALLOW_IPS "" || die_code "$EX_FAIL" "Could not update the state file."
+      site_sync_from_panel "$id" || true
       proxy_reload || log_warn "Caddy was not reloaded — run 'vpnsetup proxy'."
       log_ok "Access restriction removed — the panel is reachable from anywhere again."
+      if [ "$OPT_JSON" = "1" ]; then
+        json_emit "$(json_pair changed true)" "$(json_pair allow_ips null)"
+      fi
       return 0
       ;;
   esac
 
-  is_valid_ip_list "$list" || die "Not a valid IP list: $list"
+  is_valid_ip_list "$list" || die_code "$EX_USAGE" "Not a valid IP list: $list"
 
-  state_set "$id" ALLOW_IPS "$list" || die "Could not update the state file."
-  proxy_reload || die "Caddy rejected the new configuration — the previous one is still active."
+  state_set "$id" ALLOW_IPS "$list" || die_code "$EX_FAIL" "Could not update the state file."
+  site_sync_from_panel "$id" || true
+  proxy_reload || die_code "$EX_FAIL" "Caddy rejected the new configuration — the previous one is still active."
 
   log_ok "Panel access restricted to: $list"
   log_dim "Subscriptions on the subscription domain remain public."
   log_warn "If you lock yourself out, SSH in and run: vpnsetup allow-ips $id clear"
+
+  if [ "$OPT_JSON" = "1" ]; then
+    json_emit "$(json_pair changed true)" "$(json_pair allow_ips "$(json_str "$list")")"
+  fi
+  return 0
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Backup / restore
+#
+# `backup <panel>` used to be the only entry point, so the only way to see what
+# archives exist was to read the directory by hand — which a control panel
+# cannot do without duplicating the path logic. Hence `backup list`.
+# ──────────────────────────────────────────────────────────────────────────────
 cmd_backup() {
+  local first="${1:-}" second="${2:-}"
+
+  if [ "$first" = "list" ] || [ "$first" = "ls" ]; then
+    cmd_backup_list "$second"
+    return $?
+  fi
+
+  [ -n "$first" ] || first="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$first" || { log_error "Panel '$first' is not installed."; return "$EX_NOTFOUND"; }
+
+  backup_create "$first" || return "$EX_FAIL"
+
+  if [ "$OPT_JSON" = "1" ]; then
+    local latest
+    latest="$(backup_list "$first" | head -1)"
+    json_emit \
+      "$(json_pair panel "$(json_str "$first")")" \
+      "$(json_pair archive "$(json_nullable_str "$latest")")"
+  fi
+  return 0
+}
+
+cmd_backup_list() {
   local id="${1:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
-  backup_create "$id"
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || { log_error "Panel '$id' is not installed."; return "$EX_NOTFOUND"; }
+
+  local files; files="$(backup_list "$id")"
+
+  if [ "$OPT_JSON" = "1" ]; then
+    local items="" f
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      items="${items:+$items,}$(json_object \
+        "$(json_pair name "$(json_str "$(basename "$f")")")" \
+        "$(json_pair path "$(json_str "$f")")" \
+        "$(json_pair size "$(json_num "$(_file_size "$f")")")" \
+        "$(json_pair modified "$(json_num "$(_file_mtime "$f")")")")"
+    done <<<"$files"
+    json_emit "$(json_pair panel "$(json_str "$id")")" "$(json_pair backups "[$items]")"
+    return 0
+  fi
+
+  if [ -z "$files" ]; then
+    log_warn "No backups for $id in $(backup_dir_for "$id")."
+    return 0
+  fi
+
+  ui_title "Backups — $(panel_catalog_name "$id")"
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '  %s  %8s  %s\n' "$(basename "$f")" \
+      "$(_human_size "$(_file_size "$f")")" \
+      "$(date -d "@$(_file_mtime "$f")" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '-')"
+  done <<<"$files"
+  return 0
 }
 
 cmd_restore() {
   local id="${1:-}"
-  [ -n "$id" ] || id="$(ui_select_installed)" || return 1
+  [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
+  state_exists "$id" || { log_error "Panel '$id' is not installed."; return "$EX_NOTFOUND"; }
+
   backup_restore "$id" "${2:-}"
+  return $?
 }

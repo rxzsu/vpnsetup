@@ -2,7 +2,19 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # ui.sh — banner, menus, interactive selection.
 # Requires common.sh and panels.sh to be sourced first.
+#
+# Under --json, stdout is reserved for the single JSON document, so every
+# decoration here is routed to stderr by ui_printf. That is what lets any command
+# print a normal-looking title and still be safe to parse.
 # ──────────────────────────────────────────────────────────────────────────────
+
+ui_printf() {
+  if [ "${OPT_JSON:-0}" = "1" ]; then
+    printf "$@" >&2
+  else
+    printf "$@"
+  fi
+}
 
 ui_banner() {
   clear 2>/dev/null || true
@@ -17,12 +29,12 @@ ui_banner() {
 
 ui_title() {
   local text="$1"
-  printf '\n%s%s%s\n' "$C_BOLD$C_BCYAN" "$text" "$C_RESET"
-  printf '%s%s%s\n' "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 62))" "$C_RESET"
+  ui_printf '\n%s%s%s\n' "$C_BOLD$C_BCYAN" "$text" "$C_RESET"
+  ui_printf '%s%s%s\n' "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 62))" "$C_RESET"
 }
 
 ui_kv() {
-  printf '  %s%-16s%s %s\n' "$C_BWHITE" "$1" "$C_RESET" "$2"
+  ui_printf '  %s%-16s%s %s\n' "$C_BWHITE" "$1" "$C_RESET" "$2"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -39,13 +51,13 @@ ui_select_installed() {
     printf '%s' "$VPN_SETUP_PANEL"; return 0
   fi
 
-  local ids=()
+  local ids=() id
   while IFS= read -r id; do [ -n "$id" ] && ids+=("$id"); done < <(state_ids)
 
   [ "${#ids[@]}" -eq 0 ] && return 1
   if [ "${#ids[@]}" -eq 1 ]; then printf '%s' "${ids[0]}"; return 0; fi
 
-  local i=1 id
+  local i=1
   printf '\n' >&2
   for id in "${ids[@]}"; do
     printf '  %s%d)%s %-12s %s%s%s\n' "$C_BBLUE" "$i" "$C_RESET" \
@@ -73,13 +85,16 @@ ui_select_panel() {
   while IFS= read -r id; do [ -n "$id" ] && ids+=("$id"); done < <(panel_catalog_ids)
 
   local i=1
-  printf '\n'
+  # The menu goes to stderr: this function's stdout is the chosen id, and the
+  # caller captures it with $(...) — anything else printed here would be
+  # swallowed into the value.
+  printf '\n' >&2
   for id in "${ids[@]}"; do
     printf '  %s%d)%s %s%-12s%s %s\n' "$C_BBLUE" "$i" "$C_RESET" \
-      "$C_BOLD$C_BWHITE" "$(panel_catalog_name "$id")" "$C_RESET" "$(panel_catalog_desc "$id")"
+      "$C_BOLD$C_BWHITE" "$(panel_catalog_name "$id")" "$C_RESET" "$(panel_catalog_desc "$id")" >&2
     i=$((i + 1))
   done
-  printf '\n'
+  printf '\n' >&2
 
   local choice
   choice="$(ask "Which panel (number)" "1")"
@@ -119,6 +134,8 @@ ui_main_menu() {
     printf '  %s7)%s Re-apply reverse proxy + SSL\n'          "$C_BBLUE" "$C_RESET"
     printf '  %s8)%s Change a panel domain\n'                 "$C_BBLUE" "$C_RESET"
     printf '  %s9)%s Restrict access by IP\n'                 "$C_BBLUE" "$C_RESET"
+    printf '  %ss)%s Published sites  %s(Caddy)%s\n'           "$C_BBLUE" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '  %sj)%s Background jobs\n'                        "$C_BBLUE" "$C_RESET"
     printf '  %sd)%s Run diagnostics  %s(doctor)%s\n'          "$C_BBLUE" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '  %sr)%s Remove a panel  %s(destructive)%s\n'      "$C_RED"   "$C_RESET" "$C_DIM" "$C_RESET"
     printf '  %s0)%s Exit\n'                                  "$C_RED"   "$C_RESET"
@@ -136,6 +153,8 @@ ui_main_menu() {
       7) id="$(ui_select_installed)" && cmd_proxy_reapply "$id"; press_any_key ;;
       8) id="$(ui_select_installed)" && cmd_set_domain "$id"; press_any_key ;;
       9) id="$(ui_select_installed)" && cmd_set_allow_ips "$id"; press_any_key ;;
+      s) cmd_sites; press_any_key ;;
+      j) cmd_jobs; press_any_key ;;
       d) doctor_run; press_any_key ;;
       r) id="$(ui_select_installed)" && cmd_remove "$id"; press_any_key ;;
       0) printf '\n%sBye.%s\n\n' "$C_DIM" "$C_RESET"; exit 0 ;;

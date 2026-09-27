@@ -131,12 +131,17 @@ ensure_docker() {
 # ──────────────────────────────────────────────────────────────────────────────
 readonly MODULES=(
   "install.sh"
+  "lib/json.sh"
+  "lib/lock.sh"
   "lib/common.sh"
+  "lib/job.sh"
+  "lib/sites.sh"
   "lib/docker.sh"
   "lib/proxy.sh"
   "lib/backup.sh"
   "lib/panels.sh"
   "lib/doctor.sh"
+  "lib/agent.sh"
   "lib/ui.sh"
   "lib/main.sh"
   "lib/panels/3x-ui.sh"

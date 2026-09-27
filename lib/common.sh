@@ -15,15 +15,35 @@ set -uo pipefail
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-readonly VPN_SETUP_VERSION="0.1.0"
+readonly VPN_SETUP_VERSION="0.2.0"
+
+# Shape of every --json document. Bumped when a field changes meaning, so a
+# consumer can refuse a payload it does not understand instead of guessing.
+readonly SCHEMA_VERSION=1
 
 readonly STATE_DIR="${VPN_SETUP_STATE:-/etc/vpnsetup}"
 readonly PANELS_STATE_DIR="$STATE_DIR/panels"
+readonly SITES_STATE_DIR="$STATE_DIR/sites"
+readonly LOCK_DIR="$STATE_DIR/locks"
 readonly ROOT_DIR="${VPN_SETUP_ROOT:-/opt/vpnsetup}"
 readonly BACKUP_DIR="${VPN_SETUP_BACKUP:-/var/backups/vpnsetup}"
 readonly LOG_DIR="${VPN_SETUP_LOGS:-/var/log/vpnsetup}"
+readonly JOBS_DIR="$LOG_DIR/jobs"
+readonly AUDIT_LOG="$LOG_DIR/audit.log"
 readonly CADDY_DIR="$ROOT_DIR/caddy"
 readonly TMUX_SESSION="vpnsetup"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exit codes — a caller has to be able to tell "nothing happened" from "it broke".
+# ──────────────────────────────────────────────────────────────────────────────
+readonly EX_OK=0         # success
+readonly EX_FAIL=1       # generic failure
+readonly EX_USAGE=2      # bad arguments, or a prompt we are not allowed to ask
+readonly EX_CONFLICT=3   # already installed, port taken, resource busy
+readonly EX_NOTFOUND=4   # no such panel / backup / job / site
+readonly EX_PRECOND=5    # root, Docker, DNS — a precondition is not met
+readonly EX_PARTIAL=6    # the action happened, a follow-up step did not
+readonly EX_CANCELLED=7  # the operator declined
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Colors
@@ -52,18 +72,44 @@ fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
+#
+# Every line is also offered to the job stream, so a control panel gets the same
+# narration the terminal does without any command having to be aware of it.
 # ──────────────────────────────────────────────────────────────────────────────
-log_info()    { printf '%s[INFO]%s %s\n'  "$C_BCYAN"   "$C_RESET" "$*"; }
-log_ok()      { printf '%s[ OK ]%s %s\n'  "$C_BGREEN"  "$C_RESET" "$*"; }
-log_warn()    { printf '%s[WARN]%s %s\n'  "$C_BYELLOW" "$C_RESET" "$*" >&2; }
-log_error()   { printf '%s[FAIL]%s %s\n'  "$C_BRED"    "$C_RESET" "$*" >&2; }
-log_dim()     { printf '%s%s%s\n'         "$C_DIM"     "$*"       "$C_RESET"; }
-log_step()    { printf '\n%s▸ %s%s\n'     "$C_BOLD$C_BBLUE" "$*" "$C_RESET"; }
 
-die() {
-  log_error "$*"
-  exit 1
+# Overridden by lib/job.sh, which is sourced after this file. The no-op keeps
+# the logging helpers usable even if job.sh is not loaded.
+job_emit() { return 0; }
+
+# _log <tag> <color> <level> <out|err> <message...>
+#
+# Under --json, stdout carries exactly one JSON document and nothing else, so
+# every human line is pushed to stderr. Consumers therefore get a clean stream
+# to parse and can still show progress if they want it.
+_log() {
+  local tag="$1" color="$2" level="$3" stream="$4"; shift 4
+  if [ "$stream" = "err" ] || [ "${OPT_JSON:-0}" = "1" ]; then
+    printf '%s%s%s %s\n' "$color" "$tag" "$C_RESET" "$*" >&2
+  else
+    printf '%s%s%s %s\n' "$color" "$tag" "$C_RESET" "$*"
+  fi
+  job_emit "$level" "$*"
 }
+
+log_info()  { _log '[INFO]' "$C_BCYAN"   info  out "$*"; }
+log_ok()    { _log '[ OK ]' "$C_BGREEN"  ok    out "$*"; }
+log_warn()  { _log '[WARN]' "$C_BYELLOW" warn  err "$*"; }
+log_error() { _log '[FAIL]' "$C_BRED"    error err "$*"; }
+log_dim()   { _log ''       "$C_DIM"     dim   out "$*"; }
+log_step()  { _log '▸'      "$C_BOLD$C_BBLUE" step out "$*"; }
+
+die_code() {
+  local code="$1"; shift
+  log_error "$*"
+  exit "$code"
+}
+
+die() { die_code "$EX_FAIL" "$*"; }
 
 # Run a command that MUST succeed. Prints what it is doing first.
 run() {
@@ -99,10 +145,15 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 is_root() { [ "$(id -u)" = "0" ]; }
 
 require_root() {
-  is_root || die "This action needs root. Re-run with sudo."
+  is_root || die_code "$EX_PRECOND" "This action needs root. Re-run with sudo."
 }
 
-have_tty() { [ -t 0 ] && [ -t 1 ]; }
+# `--non-interactive` funnels every prompt through the no-terminal branch, which
+# is what makes the flag trustworthy: there is exactly one place to audit.
+have_tty() {
+  [ "${OPT_NONINTERACTIVE:-0}" = "1" ] && return 1
+  [ -t 0 ] && [ -t 1 ]
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OS / package manager
@@ -161,7 +212,7 @@ ensure_cmd() {
   log_info "Installing $pkg..."
   pkg_refresh >/dev/null 2>&1 || true
   pkg_install "$pkg" >/dev/null 2>&1 || true
-  have_cmd "$cmd" || die "Could not install '$pkg'. Please install it manually."
+  have_cmd "$cmd" || die_code "$EX_PRECOND" "Could not install '$pkg'. Please install it manually."
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -213,6 +264,50 @@ port_in_use() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Option parsing — small helpers for the subcommands that take named options.
+#
+# opt_positionals cannot know which options carry a value, so it skips the token
+# after every `--flag`. That holds for every command here (all their options take
+# a value); a boolean flag would need its own parser.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# opt_value <name> <default> <args...> — value of --name or --name=value.
+opt_value() {
+  local name="$1" default="${2-}"; shift 2
+  local a
+  while [ $# -gt 0 ]; do
+    a="$1"
+    case "$a" in
+      "--$name")   printf '%s' "${2-}"; return 0 ;;
+      "--$name="*) printf '%s' "${a#*=}"; return 0 ;;
+    esac
+    shift
+  done
+  printf '%s' "$default"
+}
+
+opt_has() {
+  local name="$1"; shift
+  local a
+  for a in "$@"; do
+    case "$a" in "--$name"|"--$name="*) return 0 ;; esac
+  done
+  return 1
+}
+
+opt_positionals() {
+  local a skip=0
+  for a in "$@"; do
+    if [ "$skip" = "1" ]; then skip=0; continue; fi
+    case "$a" in
+      --*=*) continue ;;
+      --*)   skip=1; continue ;;
+      *)     printf '%s\n' "$a" ;;
+    esac
+  done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Prompts — every read is guarded so EOF never kills the script.
 # ──────────────────────────────────────────────────────────────────────────────
 ask() {
@@ -242,11 +337,11 @@ ask_secret() {
 ask_domain() {
   local prompt="$1" d
   if [ -n "${VPN_SETUP_DOMAIN:-}" ]; then
-    is_valid_domain "$VPN_SETUP_DOMAIN" || die "VPN_SETUP_DOMAIN is not a valid domain: $VPN_SETUP_DOMAIN"
+    is_valid_domain "$VPN_SETUP_DOMAIN" || die_code "$EX_USAGE" "VPN_SETUP_DOMAIN is not a valid domain: $VPN_SETUP_DOMAIN"
     printf '%s' "$VPN_SETUP_DOMAIN"; return 0
   fi
   if ! have_tty; then
-    die "No terminal available. Set VPN_SETUP_DOMAIN to install unattended."
+    die_code "$EX_USAGE" "No terminal available. Pass --domain or set VPN_SETUP_DOMAIN."
   fi
   while true; do
     d="$(ask "$prompt")"
@@ -265,7 +360,7 @@ ask_domain() {
 ask_port() {
   local prompt="$1" default="$2" p
   if [ -n "${VPN_SETUP_PORT:-}" ]; then
-    is_valid_port "$VPN_SETUP_PORT" || die "VPN_SETUP_PORT is not a valid port: $VPN_SETUP_PORT"
+    is_valid_port "$VPN_SETUP_PORT" || die_code "$EX_USAGE" "VPN_SETUP_PORT is not a valid port: $VPN_SETUP_PORT"
     printf '%s' "$VPN_SETUP_PORT"; return 0
   fi
   if ! have_tty; then printf '%s' "$default"; return 0; fi
@@ -280,6 +375,8 @@ ask_port() {
 
 confirm() {
   local prompt="$1" default="${2:-n}" hint answer
+  # --yes answers every confirmation; nothing is destructive without it.
+  [ "${OPT_YES:-0}" = "1" ] && return 0
   # No terminal: never silently answer "yes" to a destructive question.
   if ! have_tty; then [ "$default" = "y" ]; return; fi
   if [ "$default" = "y" ]; then hint="[Y/n]"; else hint="[y/N]"; fi
@@ -289,6 +386,26 @@ confirm() {
     [yY]|[yY][eE][sS]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# confirm_action <prompt> [default] [hint]
+#
+# For actions that must not be silently skipped. Never returns non-zero: it
+# either returns 0 (go ahead) or exits with a code that says what happened —
+# EX_USAGE when we are not allowed to ask, EX_CANCELLED when the operator said no.
+#
+# Callers used to write `confirm ... || { log_info "Cancelled."; return 0; }`,
+# which reports success for a command that changed nothing. That is the worst
+# possible answer for anything automated.
+confirm_action() {
+  local prompt="$1" default="${2:-n}" hint="${3:-}"
+  confirm "$prompt" "$default" && return 0
+
+  if [ "${OPT_NONINTERACTIVE:-0}" = "1" ] && [ "${OPT_YES:-0}" != "1" ]; then
+    die_code "$EX_USAGE" "Confirmation required but --non-interactive was given.${hint:+ $hint}"
+  fi
+  log_info "Cancelled — nothing was changed."
+  exit "$EX_CANCELLED"
 }
 
 press_any_key() {
@@ -303,20 +420,27 @@ press_any_key() {
 # Keys: PANEL_ID PANEL_NAME DOMAIN PORT INSTALL_DIR PROJECT MODE DATA_DIR
 # ──────────────────────────────────────────────────────────────────────────────
 state_init() {
-  mkdir -p "$PANELS_STATE_DIR" "$ROOT_DIR" "$LOG_DIR" 2>/dev/null || true
+  mkdir -p "$PANELS_STATE_DIR" "$SITES_STATE_DIR" "$LOCK_DIR" \
+           "$ROOT_DIR" "$LOG_DIR" "$JOBS_DIR" 2>/dev/null || true
 }
 
 # state_write <id> <key=value> ...
+#
+# Full rewrite, but through a temporary file and an atomic rename, so a reader
+# never sees a half-written state file. That is what lets reads stay lock-free.
 state_write() {
   local id="$1"; shift
   state_init
   local file="$PANELS_STATE_DIR/$id.env"
+  local tmp="$file.tmp.$$"
   {
     printf 'PANEL_ID=%s\n' "$id"
     local kv
     for kv in "$@"; do printf '%s\n' "$kv"; done
-  } > "$file"
-  chmod 600 "$file" 2>/dev/null || true
+  } >"$tmp" || { log_error "Could not write $tmp"; return "$EX_FAIL"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file" || { rm -f "$tmp"; log_error "Could not replace $file"; return "$EX_FAIL"; }
+  return 0
 }
 
 # state_get <id> <key> [default]
@@ -333,12 +457,21 @@ state_exists() { [ -f "$PANELS_STATE_DIR/$1.env" ]; }
 
 # state_set <id> <KEY> <value> — update one key in place, appending it if the
 # key is absent. Everything else in the file is left untouched.
+#
+# This is a read-modify-write, so two of them racing would lose one of the two
+# changes. Hence the lock: it is short, and it is the only place that needs one.
 state_set() {
   local id="$1" key="$2" value="$3"
   local file="$PANELS_STATE_DIR/$id.env"
-  [ -f "$file" ] || { log_error "No state file for panel '$id'."; return 1; }
-  env_set "$file" "$key" "$value" || return 1
+  [ -f "$file" ] || { log_error "No state file for panel '$id'."; return "$EX_NOTFOUND"; }
+
+  lock_take "state" || return "$EX_FAIL"
+  env_set "$file" "$key" "$value"; local rc=$?
+  lock_release
+  [ "$rc" -eq 0 ] || return "$rc"
+
   chmod 600 "$file" 2>/dev/null || true
+  return 0
 }
 
 state_delete() { rm -f "$PANELS_STATE_DIR/$1.env"; }
@@ -412,7 +545,10 @@ write_secret_file() {
 # appending it when absent. Writes the plain `KEY=value` form because that is
 # the only form every consumer accepts — Docker Compose's env_file parser is
 # stricter than a dotenv library. Values containing whitespace or a `#` get
-# quoted. Uses POSIX sed only, so it works with busybox sed too.
+# quoted.
+#
+# The temporary file carries the pid: with a fixed name, two concurrent calls on
+# the same file would fight over one path and one of them would lose its result.
 # ──────────────────────────────────────────────────────────────────────────────
 env_set() {
   local file="$1" key="$2" value="$3" rendered
@@ -424,10 +560,11 @@ env_set() {
   if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null; then
     # The replacement goes through a temp file: sed's `s|...|...|` with an
     # arbitrary value would otherwise need escaping of | & and backslashes.
+    local tmp="$file.vpnsetup.tmp.$$"
     awk -v key="$key" -v line="$rendered" '
       !done && $0 ~ "^[[:space:]]*#?[[:space:]]*" key "[[:space:]]*=" { print line; done=1; next }
       { print }
-    ' "$file" > "$file.vpnsetup.tmp" && mv "$file.vpnsetup.tmp" "$file"
+    ' "$file" > "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
   else
     printf '%s\n' "$rendered" >> "$file"
   fi

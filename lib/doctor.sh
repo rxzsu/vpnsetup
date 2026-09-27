@@ -19,13 +19,34 @@ DOCTOR_OK=0
 DOCTOR_WARN=0
 DOCTOR_FAIL=0
 
-doctor_ok()   { printf '  %sok  %s %s\n' "$C_BGREEN"  "$C_RESET" "$*"; DOCTOR_OK=$((DOCTOR_OK + 1)); }
-doctor_warn() { printf '  %swarn%s %s\n' "$C_BYELLOW" "$C_RESET" "$*"; DOCTOR_WARN=$((DOCTOR_WARN + 1)); }
-doctor_fail() { printf '  %sfail%s %s\n' "$C_BRED"    "$C_RESET" "$*"; DOCTOR_FAIL=$((DOCTOR_FAIL + 1)); }
-doctor_note() { printf '  %s .. %s %s\n' "$C_DIM"     "$C_RESET" "$*"; }
+# Every check is also recorded, so the same run can be rendered as a report for
+# a human or as a document for a control panel. Entries are
+# "<level><TAB><section><TAB><message>".
+DOCTOR_CHECKS=()
+DOCTOR_SECTION_NAME=""
+
+_doctor_record() {
+  local level="$1" tag="$2" color="$3" msg="$4"
+  DOCTOR_CHECKS+=("$level"$'\t'"$DOCTOR_SECTION_NAME"$'\t'"$msg")
+  if [ "${OPT_JSON:-0}" = "1" ]; then
+    printf '  %s%s%s %s\n' "$color" "$tag" "$C_RESET" "$msg" >&2
+  else
+    printf '  %s%s%s %s\n' "$color" "$tag" "$C_RESET" "$msg"
+  fi
+}
+
+doctor_ok()   { DOCTOR_OK=$((DOCTOR_OK + 1));     _doctor_record ok   'ok  ' "$C_BGREEN"  "$*"; }
+doctor_warn() { DOCTOR_WARN=$((DOCTOR_WARN + 1)); _doctor_record warn 'warn' "$C_BYELLOW" "$*"; }
+doctor_fail() { DOCTOR_FAIL=$((DOCTOR_FAIL + 1)); _doctor_record fail 'fail' "$C_BRED"    "$*"; }
+doctor_note() {                                   _doctor_record note ' .. ' "$C_DIM"     "$*"; }
 
 doctor_section() {
-  printf '\n%s%s%s\n' "$C_BOLD$C_BWHITE" "$1" "$C_RESET"
+  DOCTOR_SECTION_NAME="$1"
+  if [ "${OPT_JSON:-0}" = "1" ]; then
+    printf '\n%s%s%s\n' "$C_BOLD$C_BWHITE" "$1" "$C_RESET" >&2
+  else
+    printf '\n%s%s%s\n' "$C_BOLD$C_BWHITE" "$1" "$C_RESET"
+  fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -350,6 +371,8 @@ doctor_run() {
   DOCTOR_OK=0
   DOCTOR_WARN=0
   DOCTOR_FAIL=0
+  DOCTOR_CHECKS=()
+  DOCTOR_SECTION_NAME=""
 
   ui_title "Diagnostics"
 
@@ -369,6 +392,36 @@ doctor_run() {
   fi
 
   doctor_check_caddy
+
+  if [ "$OPT_JSON" = "1" ]; then
+    local items="" i=0 n="${#DOCTOR_CHECKS[@]}" entry level rest section msg
+    while [ "$i" -lt "$n" ]; do
+      entry="${DOCTOR_CHECKS[$i]}"
+      level="${entry%%$'\t'*}"
+      rest="${entry#*$'\t'}"
+      section="${rest%%$'\t'*}"
+      msg="${rest#*$'\t'}"
+      items="${items:+$items,}$(json_object \
+        "$(json_pair level "$(json_str "$level")")" \
+        "$(json_pair section "$(json_str "$section")")" \
+        "$(json_pair message "$(json_str "$msg")")")"
+      i=$((i + 1))
+    done
+
+    local healthy=0
+    [ "$DOCTOR_FAIL" -eq 0 ] && healthy=1
+
+    json_emit \
+      "$(json_pair healthy "$(json_bool "$healthy")")" \
+      "$(json_pair summary "$(json_object \
+        "$(json_pair passed "$(json_num "$DOCTOR_OK")")" \
+        "$(json_pair warnings "$(json_num "$DOCTOR_WARN")")" \
+        "$(json_pair failed "$(json_num "$DOCTOR_FAIL")")")")" \
+      "$(json_pair checks "[$items]")"
+
+    [ "$DOCTOR_FAIL" -eq 0 ]
+    return $?
+  fi
 
   printf '\n'
   printf '%s%s%s\n' "$C_MAGENTA" "$(printf '─%.0s' $(seq 1 62))" "$C_RESET"

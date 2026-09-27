@@ -155,6 +155,40 @@ compose_service_running() {
   [ -n "$id" ] && [ "$(container_state "$id")" = "running" ]
 }
 
+compose_container_ids() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  dc "$dir" ps -q 2>/dev/null || true
+}
+
+# compose_containers <dir> — one line per container: name|service|state|health
+#
+# `docker compose ps --format json` only exists in newer Compose releases and its
+# shape has changed between them, so the facts are read from `docker inspect`
+# instead. That output is a stable, documented contract.
+compose_containers() {
+  local dir="$1" ids
+  ids="$(compose_container_ids "$dir")"
+  [ -n "$ids" ] || return 0
+  # shellcheck disable=SC2086
+  docker inspect --format '{{.Name}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' \
+    $ids 2>/dev/null | sed 's#^/##' || true
+}
+
+# compose_containers_json <dir> — the same facts as a JSON array.
+compose_containers_json() {
+  local dir="$1" items="" name svc state health
+  while IFS='|' read -r name svc state health; do
+    [ -n "$name" ] || continue
+    items="${items:+$items,}$(json_object \
+      "$(json_pair name "$(json_str "$name")")" \
+      "$(json_pair service "$(json_str "$svc")")" \
+      "$(json_pair state "$(json_str "$state")")" \
+      "$(json_pair health "$(json_str "$health")")")"
+  done < <(compose_containers "$dir")
+  printf '[%s]' "$items"
+}
+
 # wait_container_running <name> <timeout>
 wait_container_running() {
   local name="$1" timeout="${2:-90}" waited=0 state

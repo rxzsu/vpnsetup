@@ -17,6 +17,35 @@ readonly BACKUP_KEEP="${VPN_SETUP_BACKUP_KEEP:-10}"
 
 backup_dir_for() { printf '%s/%s' "$BACKUP_DIR" "$1"; }
 
+# Size and mtime without assuming GNU stat: `stat -c` exists in coreutils and
+# busybox, but the fallbacks cost nothing and keep this honest.
+_file_size() {
+  local n
+  n="$(stat -c '%s' "$1" 2>/dev/null || true)"
+  [ -n "$n" ] || n="$(wc -c <"$1" 2>/dev/null | tr -d ' ')"
+  printf '%s' "${n:-0}"
+}
+
+_file_mtime() {
+  local n
+  n="$(stat -c '%Y' "$1" 2>/dev/null || true)"
+  [ -n "$n" ] || n="$(date -r "$1" +%s 2>/dev/null || true)"
+  printf '%s' "${n:-0}"
+}
+
+_human_size() {
+  local bytes="${1:-0}"
+  if [ "$bytes" -ge 1073741824 ]; then
+    printf '%s.%sG' "$((bytes / 1073741824))" "$(((bytes % 1073741824) / 107374182))"
+  elif [ "$bytes" -ge 1048576 ]; then
+    printf '%s.%sM' "$((bytes / 1048576))" "$(((bytes % 1048576) / 104857))"
+  elif [ "$bytes" -ge 1024 ]; then
+    printf '%sK' "$((bytes / 1024))"
+  else
+    printf '%sB' "$bytes"
+  fi
+}
+
 backup_check_space() {
   local dir="$1" need_mb="${2:-200}" avail
   mkdir -p "$dir"
