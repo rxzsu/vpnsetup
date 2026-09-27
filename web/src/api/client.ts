@@ -38,8 +38,54 @@ export const api = {
 
   panels: () => req<{ panels: PanelSummary[] }>('/api/panels'),
   users: (id: string) => req<{ users: UnifiedUser[] }>(`/api/panels/${id}/users`),
-  nodes: (id: string) => req<{ nodes: UnifiedNode[] }>(`/api/panels/${id}/nodes`),
+  nodes: (id: string) => req<{ nodes: UnifiedNode[]; capabilities: NodeCapabilities }>(`/api/panels/${id}/nodes`),
   stats: (id: string) => req<{ stats: UnifiedStats }>(`/api/panels/${id}/stats`),
+
+  nodeOptions: (id: string) =>
+    req<{ capabilities: NodeCapabilities; profiles: ConfigProfile[] }>(`/api/panels/${id}/node-options`),
+  createNode: (id: string, input: CreateNodeInput) =>
+    req<{ node: UnifiedNode }>(`/api/panels/${id}/nodes`, { method: 'POST', body: JSON.stringify(input) }),
+  deleteNode: (id: string, nid: string) =>
+    req<{ ok: true }>(`/api/panels/${id}/nodes/${encodeURIComponent(nid)}`, { method: 'DELETE' }),
+  restartNode: (id: string, nid: string) =>
+    req<{ ok: true }>(`/api/panels/${id}/nodes/${encodeURIComponent(nid)}/restart`, { method: 'POST' }),
+  setNodeEnabled: (id: string, nid: string, enabled: boolean) =>
+    req<{ node: UnifiedNode }>(`/api/panels/${id}/nodes/${encodeURIComponent(nid)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
+
+  createUser: (id: string, input: CreateUserInput) =>
+    req<{ user: UnifiedUser }>(`/api/panels/${id}/users`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  updateUser: (id: string, uid: string, patch: UpdateUserInput) =>
+    req<{ user: UnifiedUser }>(`/api/panels/${id}/users/${encodeURIComponent(uid)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteUser: (id: string, uid: string) =>
+    req<{ ok: true }>(`/api/panels/${id}/users/${encodeURIComponent(uid)}`, { method: 'DELETE' }),
+  resetUser: (id: string, uid: string) =>
+    req<{ ok: true }>(`/api/panels/${id}/users/${encodeURIComponent(uid)}/reset`, { method: 'POST' }),
+  revokeUser: (id: string, uid: string) =>
+    req<{ user: UnifiedUser }>(`/api/panels/${id}/users/${encodeURIComponent(uid)}/revoke`, {
+      method: 'POST',
+    }),
+}
+
+export interface CreateUserInput {
+  username: string
+  limitBytes?: number
+  expiresAt?: string | null
+  inboundIds?: number[]
+}
+
+export interface UpdateUserInput {
+  status?: 'active' | 'disabled'
+  limitBytes?: number
+  expiresAt?: string | null
 }
 
 export interface PanelSummary {
@@ -71,6 +117,28 @@ export interface UnifiedNode {
   address: string
   status: string
   usersOnline: number | null
+}
+
+export interface NodeCapabilities {
+  canAdd: boolean
+  canDelete: boolean
+  canRestart: boolean
+  canToggle: boolean
+}
+
+export interface ConfigProfile {
+  uuid: string
+  name: string
+  inbounds: { uuid: string; tag: string; type: string; port: number | null }[]
+}
+
+export interface CreateNodeInput {
+  name: string
+  address: string
+  port?: number
+  apiPort?: number
+  profileUuid?: string
+  inboundUuids?: string[]
 }
 
 export interface UnifiedStats {

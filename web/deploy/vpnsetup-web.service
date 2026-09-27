@@ -1,0 +1,21 @@
+[Unit]
+Description=vpnsetup web control panel
+After=network-online.target vpnsetup-agent.socket
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpnweb
+Group=vpnsetup
+WorkingDirectory=/opt/vpnsetup-web
+EnvironmentFile=/etc/vpnsetup-web.env
+ExecStart=/usr/local/bin/bun server/index.ts
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -67,6 +67,51 @@ try {
 
   const index = await (await fetch(`${base}/`)).text()
   check('SPA index served', index.includes('<div id="app">'))
+
+  const authed = { 'Content-Type': 'application/json', cookie }
+  const create = await fetch(`${base}/api/panels/marzban/users`, {
+    method: 'POST',
+    headers: authed,
+    body: JSON.stringify({ username: 'test' }),
+  })
+  check('create on unconfigured panel is 502', create.status === 502)
+
+  const del = await fetch(`${base}/api/panels/marzban/users/test`, {
+    method: 'DELETE',
+    headers: { cookie },
+  })
+  check('delete on unconfigured panel is 502', del.status === 502)
+
+  const noName = await fetch(`${base}/api/panels/marzban/users`, {
+    method: 'POST',
+    headers: authed,
+    body: JSON.stringify({}),
+  })
+  check('create without username is 400', noName.status === 400)
+
+  const nodeCreate = await fetch(`${base}/api/panels/marzban/nodes`, {
+    method: 'POST',
+    headers: authed,
+    body: JSON.stringify({ name: 'n1', address: '10.0.0.1' }),
+  })
+  check('node create on unconfigured panel is 502', nodeCreate.status === 502)
+
+  const noAddr = await fetch(`${base}/api/panels/marzban/nodes`, {
+    method: 'POST',
+    headers: authed,
+    body: JSON.stringify({ name: 'n1' }),
+  })
+  check('node create without address is 400', noAddr.status === 400)
+
+  const opts = await fetch(`${base}/api/panels/remnawave/node-options`, { headers: { cookie } })
+  check('node-options on unconfigured panel is 502', opts.status === 502)
+
+  const toggle = await fetch(`${base}/api/panels/3x-ui/nodes/1`, {
+    method: 'PATCH',
+    headers: authed,
+    body: JSON.stringify({ enabled: true }),
+  })
+  check('node toggle on unconfigured panel is 502', toggle.status === 502)
 } finally {
   child.kill()
 }

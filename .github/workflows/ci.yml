@@ -15,7 +15,7 @@ jobs:
       - name: Syntax check (bash -n)
         run: |
           bad=0
-          for f in install.sh bin/vpnsetup lib/*.sh lib/panels/*.sh tests/smoke.sh; do
+          for f in install.sh bin/vpnsetup lib/*.sh lib/panels/*.sh tests/smoke.sh web/deploy/install.sh; do
             bash -n "$f" || { echo "FAIL: $f"; bad=1; }
           done
           exit "$bad"

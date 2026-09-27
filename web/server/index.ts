@@ -123,8 +123,92 @@ Bun.serve({
         const adapter = adapters()[m[1] as PanelId]
         if (!adapter) return json({ message: 'unknown panel' }, 404)
         if (m[2] === 'users') return json({ users: await adapter.listUsers() })
-        if (m[2] === 'nodes') return json({ nodes: await adapter.listNodes() })
+        if (m[2] === 'nodes') {
+          return json({ nodes: await adapter.listNodes(), capabilities: adapter.nodeCapabilities })
+        }
         return json({ stats: await adapter.getStats() })
+      }
+
+      const mu = url.pathname.match(/^\/api\/panels\/([^/]+)\/users(?:\/([^/]+)(?:\/(reset|revoke))?)?$/)
+      if (mu) {
+        const adapter = adapters()[mu[1] as PanelId]
+        if (!adapter) return json({ message: 'unknown panel' }, 404)
+        const uid = mu[2] ? decodeURIComponent(mu[2]) : ''
+        if (req.method === 'POST' && !uid) {
+          const body = (await req.json()) as {
+            username: string
+            limitBytes?: number
+            expiresAt?: string | null
+            inboundIds?: number[]
+          }
+          if (!body?.username) return json({ message: 'username is required' }, 400)
+          return json({ user: await adapter.createUser(body) })
+        }
+        if (!uid) return json({ message: 'not found' }, 404)
+        if (req.method === 'PATCH' && !mu[3]) {
+          const body = (await req.json()) as {
+            status?: 'active' | 'disabled'
+            limitBytes?: number
+            expiresAt?: string | null
+          }
+          return json({ user: await adapter.updateUser(uid, body ?? {}) })
+        }
+        if (req.method === 'DELETE' && !mu[3]) {
+          await adapter.deleteUser(uid)
+          return json({ ok: true })
+        }
+        if (req.method === 'POST' && mu[3] === 'reset') {
+          await adapter.resetTraffic(uid)
+          return json({ ok: true })
+        }
+        if (req.method === 'POST' && mu[3] === 'revoke') {
+          return json({ user: await adapter.revokeSub(uid) })
+        }
+      }
+
+      const mo = url.pathname.match(/^\/api\/panels\/([^/]+)\/node-options$/)
+      if (mo && req.method === 'GET') {
+        const adapter = adapters()[mo[1] as PanelId]
+        if (!adapter) return json({ message: 'unknown panel' }, 404)
+        const profiles = adapter.id === 'remnawave' ? await adapter.listConfigProfiles() : []
+        return json({ capabilities: adapter.nodeCapabilities, profiles })
+      }
+
+      const mn = url.pathname.match(/^\/api\/panels\/([^/]+)\/nodes(?:\/([^/]+)(?:\/(restart))?)?$/)
+      if (mn) {
+        const adapter = adapters()[mn[1] as PanelId]
+        if (!adapter) return json({ message: 'unknown panel' }, 404)
+        const nid = mn[2] ? decodeURIComponent(mn[2]) : ''
+        if (req.method === 'POST' && !nid) {
+          const body = (await req.json()) as {
+            name: string
+            address: string
+            port?: number
+            apiPort?: number
+            profileUuid?: string
+            inboundUuids?: string[]
+          }
+          if (!body?.name || !body?.address) {
+            return json({ message: 'name and address are required' }, 400)
+          }
+          return json({ node: await adapter.createNode(body) })
+        }
+        if (!nid) return json({ message: 'not found' }, 404)
+        if (req.method === 'DELETE' && !mn[3]) {
+          await adapter.deleteNode(nid)
+          return json({ ok: true })
+        }
+        if (req.method === 'POST' && mn[3] === 'restart') {
+          await adapter.restartNode(nid)
+          return json({ ok: true })
+        }
+        if (req.method === 'PATCH' && !mn[3]) {
+          const body = (await req.json()) as { enabled?: boolean }
+          if (typeof body?.enabled !== 'boolean') {
+            return json({ message: 'enabled must be boolean' }, 400)
+          }
+          return json({ node: await adapter.setNodeEnabled(nid, body.enabled) })
+        }
       }
     } catch (e) {
       return err(e)
