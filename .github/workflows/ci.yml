@@ -33,3 +33,26 @@ jobs:
         uses: ludeeus/action-shellcheck@2.0.0
         with:
           severity: warning
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend (vite build, no vue-tsc)
+        run: bun run build
+
+      - name: Server selftest (auth flow, guards, SPA)
+        run: |
+          export WEB_ADMIN_PASSWORD_HASH=$(bun server/hash-password.ts secret123)
+          bun server/selftest.ts
