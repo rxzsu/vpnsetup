@@ -111,9 +111,14 @@ job_ids() {
 }
 
 # Newest first.
+# ls -1t prints one file per line, so read line-wise: `for f in $(ls ...)`
+# would split ids on spaces. Ids themselves are date-pid (no spaces), but
+# $JOBS_DIR may contain them, so keep it line-oriented anyway.
 job_ids_newest() {
+  [ -d "${JOBS_DIR:-}" ] || return 0
   local f
-  for f in $(ls -1t "$JOBS_DIR"/*.ndjson 2>/dev/null); do
+  ls -1t "$JOBS_DIR"/*.ndjson 2>/dev/null | while IFS= read -r f; do
+    [ -n "$f" ] || continue
     basename "$f" .ndjson
   done
 }
@@ -172,8 +177,8 @@ _job_json() {
     "$(json_pair id "$(json_str "$id")")" \
     "$(json_pair label "$(json_str "$(job_label "$id")")")" \
     "$(json_pair state "$(json_str "$state")")" \
-    "$(json_pair exit_code "$(json_nullable_str "$code")")" \
-    "$(json_pair pid "$(json_num "$(job_pid "$id")")")" \
+    "$(json_pair exit_code "$(json_nullable_num "$code")")" \
+    "$(json_pair pid "$(json_nullable_num "$(job_pid "$id")")")" \
     "$(json_pair last_message "$(json_str "$(job_last_msg "$id")")")" \
     "$(json_pair events "$(json_num "$(wc -l <"$(job_file "$id")" 2>/dev/null | tr -d ' ')")")"
 }

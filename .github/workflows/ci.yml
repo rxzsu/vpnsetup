@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax check (bash -n)
+        run: |
+          bad=0
+          for f in install.sh bin/vpnsetup lib/*.sh lib/panels/*.sh tests/smoke.sh; do
+            bash -n "$f" || { echo "FAIL: $f"; bad=1; }
+          done
+          exit "$bad"
+
+      - name: Smoke tests
+        run: bash tests/smoke.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck (warnings only, never blocks merge)
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: warning

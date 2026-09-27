@@ -62,6 +62,11 @@ backup_create() {
   local id="$1"
   state_exists "$id" || die "Panel '$id' is not installed."
 
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
+
   local name dir ts stage archive kind
   name="$(panel_catalog_name "$id")"
   dir="$(backup_dir_for "$id")"
@@ -196,6 +201,11 @@ backup_restore() {
   local id="$1" archive="${2:-}"
   state_exists "$id" || die "Panel '$id' is not installed."
 
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
+
   if [ -z "$archive" ]; then
     local files=()
     while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(backup_list "$id")
@@ -213,7 +223,8 @@ backup_restore() {
     printf '\n'
     local choice; choice="$(ask "Which backup (number, Enter = latest)" "1")"
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#files[@]}" ]; then
-      log_warn "Cancelled."; return 1
+      log_info "Cancelled — nothing was changed."
+      return "$EX_CANCELLED"
     fi
     archive="${files[$((choice - 1))]}"
   fi
@@ -221,7 +232,7 @@ backup_restore() {
   [ -f "$archive" ] || die "Archive not found: $archive"
 
   log_warn "Restoring will OVERWRITE the current data of $(panel_catalog_name "$id")."
-  confirm "Continue?" "n" || { log_info "Cancelled."; return 0; }
+  confirm_action "Continue?" "n" "Pass --yes to confirm."
 
   local stage; stage="$(mktemp -d)"
   tar -xzf "$archive" -C "$stage" || { log_error "Could not read the archive."; rm -rf "$stage"; return 1; }

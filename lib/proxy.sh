@@ -126,7 +126,10 @@ proxy_preflight() {
         log_warn "Port $port is already in use on this host."
       fi
       log_warn "Caddy needs ports 80 and 443 free to issue certificates."
-      if ! confirm "Continue anyway?" "n"; then return 1; fi
+      if ! confirm "Continue anyway?" "n"; then
+        log_info "Cancelled — nothing was changed."
+        return "$EX_CANCELLED"
+      fi
     fi
   done
   return 0

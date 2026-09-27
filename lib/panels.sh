@@ -308,6 +308,17 @@ cmd_install() {
     return "$EX_FAIL"
   fi
 
+  # One writer per panel: two concurrent installs of the same id both passed
+  # the state_exists check above and then raced on directories and state.
+  # The lock is re-entrant via lock_held so cmd_install -> cmd_remove (reinstall)
+  # does not deadlock against itself; the inner call simply sees the held lock.
+  # Self-clearing RETURN trap: release exactly the lock we took, then drop
+  # the trap so later functions in this process do not inherit it.
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
+
   ui_title "Install $(panel_catalog_name "$id")"
   ui_kv "Upstream"   "$(panel_catalog_upstream "$id")"
   ui_kv "License"    "$(panel_catalog_license "$id")"
@@ -388,6 +399,11 @@ cmd_update() {
   local id="${1:-}"
   [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
   state_exists "$id" || { log_error "Panel '$id' is not installed."; return "$EX_NOTFOUND"; }
+
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
 
   local slug fn dir
   slug="$(id_slug "$id")"
@@ -514,6 +530,11 @@ cmd_remove() {
     return "$EX_NOTFOUND"
   fi
 
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
+
   local slug fn dir
   slug="$(id_slug "$id")"
   fn="panel_uninstall_${slug}"
@@ -573,6 +594,11 @@ cmd_set_domain() {
   [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
   state_exists "$id" || die_code "$EX_NOTFOUND" "Panel '$id' is not installed."
 
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
+
   local slug fn current
   slug="$(id_slug "$id")"
   fn="panel_set_domain_${slug}"
@@ -629,6 +655,11 @@ cmd_set_allow_ips() {
   local id="${1:-}" list="${2:-}"
   [ -n "$id" ] || id="$(ui_select_installed)" || return "$EX_NOTFOUND"
   state_exists "$id" || die_code "$EX_NOTFOUND" "Panel '$id' is not installed."
+
+  if ! lock_held "panel-$id"; then
+    lock_take "panel-$id" || return "$EX_FAIL"
+    trap 'lock_release; trap - RETURN' RETURN
+  fi
 
   ui_title "Restrict access — $(panel_catalog_name "$id")"
   local current; current="$(state_get "$id" ALLOW_IPS)"

@@ -49,6 +49,16 @@ json_nullable_str() {
   if [ -z "${1-}" ]; then printf 'null'; else printf '"%s"' "$(json_escape "$1")"; fi
 }
 
+# json_nullable_num <value> — a number, or null when empty / not numeric.
+# Unlike json_num (which coerces junk to 0 to keep the document valid),
+# this preserves "absent" so callers can tell running (null) from exit 0.
+json_nullable_num() {
+  case "${1-}" in
+    ''|*[!0-9.-]*) printf 'null' ;;
+    *)             printf '%s' "$1" ;;
+  esac
+}
+
 json_pair() { printf '"%s":%s' "$(json_escape "$1")" "$2"; }
 
 # json_object <"key":value>... — join pre-rendered pairs.

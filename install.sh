@@ -20,7 +20,7 @@ readonly DEFAULT_REPO="rxzsu/vpnsetup"
 readonly DEFAULT_BRANCH="main"
 # ──────────────────────────────────────────────────────────────────────────────
 
-readonly INSTALLER_VERSION="0.1.0"
+readonly INSTALLER_VERSION="0.2.0"
 readonly REPO="${VPN_SETUP_REPO:-$DEFAULT_REPO}"
 readonly BRANCH="${VPN_SETUP_BRANCH:-$DEFAULT_BRANCH}"
 readonly RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
@@ -229,8 +229,12 @@ tmux_wrap() {
   # Forward the environment the user may have set, quoting every value.
   local inner=""
   local v val
-  for v in VPN_SETUP_PANEL VPN_SETUP_DOMAIN VPN_SETUP_PORT VPN_SETUP_ACTION \
-           VPN_SETUP_REPO VPN_SETUP_BRANCH VPN_SETUP_3XUI_IMAGE; do
+  for v in VPN_SETUP_PANEL VPN_SETUP_DOMAIN VPN_SETUP_SUB_DOMAIN VPN_SETUP_PORT \
+           VPN_SETUP_ALLOW_IPS VPN_SETUP_ACTION VPN_SETUP_REPO VPN_SETUP_BRANCH \
+           VPN_SETUP_3XUI_IMAGE VPN_SETUP_ROOT VPN_SETUP_STATE VPN_SETUP_BACKUP \
+           VPN_SETUP_LOGS VPN_SETUP_BACKUP_KEEP VPN_SETUP_JOBS_KEEP \
+           VPN_SETUP_LOCK_TIMEOUT VPN_SETUP_AGENT_SOCKET VPN_SETUP_AGENT_GROUP \
+           VPN_SETUP_CERT_WARN_DAYS VPN_SETUP_BACKUP_STALE_DAYS NO_COLOR; do
     eval "val=\${$v:-}"
     [ -n "$val" ] && inner="${inner}${v}=$(printf '%q' "$val") "
   done
